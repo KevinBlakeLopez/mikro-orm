@@ -1717,4 +1717,71 @@ describe.each(Utils.keys(options))('Transaction Propagation [%s]', type => {
     const names = (await orm.em.find(TestEntity, {})).map(e => e.name);
     expect(names).toEqual(['outer']);
   });
+
+  test('a subscriber failing in beforeTransactionRollback prevents the outer transaction from committing', async () => {
+    const em = orm.em.fork({ freshEventManager: true });
+    em.getEventManager().registerSubscriber({
+      beforeTransactionRollback: ({ transaction }) => {
+        if (transaction?.savepointName) {
+          throw new Error('subscriber failed');
+        }
+      },
+    });
+
+    await expect(
+      em.transactional(async em1 => {
+        await em1.insert(TestEntity, { name: 'outer' });
+
+        await expect(
+          em1.transactional(async em2 => {
+            await em2.insert(TestEntity, { name: 'inner' });
+            throw new Error('inner business error');
+          }),
+        ).rejects.toThrow('inner business error');
+      }),
+    ).rejects.toThrow('rolling back to savepoint "trx1" failed');
+
+    const count = await orm.em.count(TestEntity);
+    expect(count).toBe(0);
+  });
+
+  test('failing rollbacks of a savepoint and its parent prevent the outer transaction from committing', async () => {
+    const em = orm.em.fork();
+    const connection = em.getConnection();
+    const original = connection.rollback.bind(connection);
+    let failures = 2;
+    // fail only savepoint rollbacks, so a failing run cannot leave the top-level transaction open
+    const rollback = vi.spyOn(connection, 'rollback').mockImplementation((ctx, ...rest) => {
+      if ('savepointName' in ctx && failures-- > 0) {
+        return Promise.reject(new Error('rollback to savepoint failed'));
+      }
+
+      return original(ctx, ...rest);
+    });
+
+    await expect(
+      em.transactional(async em1 => {
+        await em1.insert(TestEntity, { name: 'outer' });
+
+        await expect(
+          em1.transactional(async em2 => {
+            await em2.insert(TestEntity, { name: 'middle' });
+
+            await expect(
+              em2.transactional(async em3 => {
+                await em3.insert(TestEntity, { name: 'inner' });
+                throw new Error('inner business error');
+              }),
+            ).rejects.toThrow('inner business error');
+          }),
+        ).rejects.toThrow('rolling back to savepoint "trx2" failed');
+      }),
+    ).rejects.toThrow('rolling back to savepoint "trx1" failed');
+
+    expect(rollback).toHaveBeenCalledTimes(3);
+    rollback.mockRestore();
+
+    const count = await orm.em.count(TestEntity);
+    expect(count).toBe(0);
+  });
 });
